@@ -1,0 +1,372 @@
+# Trusted tip-gate publisher for T-M42 on the scratch repo (default branch only).
+# No PR checkout. No self-hosted runner. No secrets stored in this file.
+# GITHUB_TOKEN may create only refs/mythos-lock/* and refs/mythos-intent/*.
+name: mythos-tip-gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: owner/name (must match this repository)
+        required: true
+        type: string
+      pr:
+        description: pull request number (optional for T-M42)
+        required: false
+        type: string
+        default: ""
+      head40:
+        description: 40-char commit SHA the check binds to
+        required: true
+        type: string
+      intent_id:
+        description: intent id for refs/mythos-intent/<intent_id>
+        required: true
+        type: string
+      lock_id:
+        description: box lock id (replayed in the payload)
+        required: true
+        type: string
+      epoch:
+        description: bound lock epoch (integer)
+        required: true
+        type: string
+      mode:
+        description: merge, backup, or carveout
+        required: true
+        type: string
+      expires_at:
+        description: RFC3339 expiry for the JIT window
+        required: true
+        type: string
+      verdict_digests:
+        description: verdict digest payload (may be empty on scratch)
+        required: false
+        type: string
+        default: ""
+      hmac:
+        description: hex HMAC-SHA256 over the payload fields (not a secret value in git)
+        required: false
+        type: string
+        default: ""
+      phase:
+        description: "publish (lock, optional stall, conclude) or takeover"
+        required: true
+        type: string
+      stall_seconds:
+        description: T-M42 stall hook — seconds to wait outside the write group after a successful lock write and before conclude (0 in normal use)
+        required: false
+        type: string
+        default: "0"
+      recovery:
+        description: Ivy-only recovery flag (must stay 0 unless recovery HMAC and allowlisted actor match)
+        required: false
+        type: string
+        default: "0"
+
+# Minimal permissions from the plan. No pull-requests: write.
+permissions:
+  checks: write
+  contents: write
+
+jobs:
+  publish-lock:
+    if: github.event.inputs.phase == 'publish'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: write
+      contents: write
+    concurrency:
+      group: mythos-tip-gate-write
+      cancel-in-progress: false
+    outputs:
+      check_id: ${{ steps.lock.outputs.check_id }}
+      bound_epoch: ${{ steps.lock.outputs.bound_epoch }}
+    steps:
+      - name: Validate payload, claim refs, open pending check
+        id: lock
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HMAC_SECRET: ${{ secrets.MYTHOS_TIP_GATE_HMAC }}
+          RECOVERY_SECRET: ${{ secrets.MYTHOS_TIP_GATE_RECOVERY_HMAC }}
+          IN_REPO: ${{ github.event.inputs.repo }}
+          IN_PR: ${{ github.event.inputs.pr }}
+          IN_HEAD40: ${{ github.event.inputs.head40 }}
+          IN_INTENT: ${{ github.event.inputs.intent_id }}
+          IN_LOCK: ${{ github.event.inputs.lock_id }}
+          IN_EPOCH: ${{ github.event.inputs.epoch }}
+          IN_MODE: ${{ github.event.inputs.mode }}
+          IN_EXPIRES: ${{ github.event.inputs.expires_at }}
+          IN_VERDICTS: ${{ github.event.inputs.verdict_digests }}
+          IN_HMAC: ${{ github.event.inputs.hmac }}
+          IN_RECOVERY: ${{ github.event.inputs.recovery }}
+        run: |
+          set -euo pipefail
+          # Do not enable xtrace; never print secrets.
+          REPO="${GITHUB_REPOSITORY}"
+          if [ "$IN_REPO" != "$REPO" ]; then
+            echo "repo input does not match this repository"
+            exit 1
+          fi
+          if ! printf '%s' "$IN_HEAD40" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "head40 must be a 40-char hex SHA"
+            exit 1
+          fi
+          if ! printf '%s' "$IN_EPOCH" | grep -Eq '^[0-9]+$'; then
+            echo "epoch must be an integer"
+            exit 1
+          fi
+          if ! printf '%s' "$IN_INTENT" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "intent_id has disallowed characters"
+            exit 1
+          fi
+          case "$IN_MODE" in
+            merge|backup) ;;
+            carveout)
+              echo "mode=carveout is not enabled on this scratch workflow until the CODEOWNERS ruleset change lands on Writer"
+              exit 1
+              ;;
+            *)
+              echo "mode is not allowed"
+              exit 1
+              ;;
+          esac
+          if [ "$IN_RECOVERY" = "1" ]; then
+            echo "recovery=1 is refused here unless an Ivy recovery HMAC and allowlisted actor are configured; this scratch dispatch is not a recovery"
+            exit 1
+          fi
+          # HMAC: if the repo secret is set, require a matching input. Never echo the secret.
+          PAYLOAD="${IN_REPO}|${IN_PR}|${IN_HEAD40}|${IN_INTENT}|${IN_LOCK}|${IN_EPOCH}|${IN_MODE}|${IN_EXPIRES}|${IN_VERDICTS}"
+          if [ -n "${HMAC_SECRET:-}" ]; then
+            EXPECTED=$(printf '%s' "$PAYLOAD" | openssl dgst -sha256 -hmac "$HMAC_SECRET" | awk '{print $NF}')
+            if [ -z "$IN_HMAC" ] || [ "$IN_HMAC" != "$EXPECTED" ]; then
+              echo "HMAC verification failed"
+              exit 1
+            fi
+          else
+            echo "MYTHOS_TIP_GATE_HMAC is unset; HMAC not verified (scratch T-M42 after a web-UI upload)"
+          fi
+          unset HMAC_SECRET RECOVERY_SECRET EXPECTED
+
+          highest_epoch() {
+            gh api "repos/${REPO}/git/matching-refs/mythos-lock" --jq '[.[] | .ref | capture("refs/mythos-lock/(?<n>[0-9]+)$") | .n | tonumber] | if length==0 then 0 else max end'
+          }
+
+          # Re-read the highest epoch before each write (T-M42 / T-M44).
+          HIGHEST=$(highest_epoch)
+          echo "highest epoch before lock write: ${HIGHEST}"
+          if [ "$HIGHEST" -gt "$IN_EPOCH" ]; then
+            echo "dispatch epoch is lower than the highest lock; refused"
+            exit 1
+          fi
+
+          # Atomic intent claim. A second create of the same name fails; resume only if SHA matches.
+          if gh api --method POST "repos/${REPO}/git/refs" -f ref="refs/mythos-intent/${IN_INTENT}" -f sha="${IN_HEAD40}"; then
+            echo "created refs/mythos-intent/${IN_INTENT}"
+          else
+            CUR=$(gh api "repos/${REPO}/git/ref/mythos-intent/${IN_INTENT}" --jq .object.sha)
+            if [ "$CUR" != "$IN_HEAD40" ]; then
+              echo "intent ref exists at a different SHA; refused"
+              exit 1
+            fi
+            echo "idempotent resume of intent ref at head40"
+          fi
+
+          HIGHEST=$(highest_epoch)
+          if [ "$HIGHEST" -gt "$IN_EPOCH" ]; then
+            echo "epoch changed before lock create; refused"
+            exit 1
+          fi
+          if gh api --method POST "repos/${REPO}/git/refs" -f ref="refs/mythos-lock/${IN_EPOCH}" -f sha="${IN_HEAD40}"; then
+            echo "created refs/mythos-lock/${IN_EPOCH}"
+          else
+            CUR=$(gh api "repos/${REPO}/git/ref/mythos-lock/${IN_EPOCH}" --jq .object.sha)
+            if [ "$CUR" != "$IN_HEAD40" ]; then
+              echo "lock ref exists at a different SHA; refused"
+              exit 1
+            fi
+            echo "lock ref already at head40"
+          fi
+
+          # Do not consult MYTHOS_MERGE_ARMED.
+          # Open the check as pending/in_progress only — never green until conclude.
+          CHECK_JSON=$(jq -nc --arg sha "$IN_HEAD40" --arg eid "$IN_INTENT" --arg s "pending window for epoch ${IN_EPOCH}"             '{name:"mythos/tip-gate",head_sha:$sha,status:"in_progress",external_id:$eid,output:{title:$s,summary:$s}}'             | gh api --method POST "repos/${REPO}/check-runs" --input -)
+          CHECK_ID=$(printf '%s' "$CHECK_JSON" | jq -r .id)
+          test -n "$CHECK_ID" && test "$CHECK_ID" != "null"
+          echo "check_id=${CHECK_ID}" >> "$GITHUB_OUTPUT"
+          echo "bound_epoch=${IN_EPOCH}" >> "$GITHUB_OUTPUT"
+          echo "opened pending mythos/tip-gate check ${CHECK_ID} on ${IN_HEAD40}"
+
+  stall:
+    # T-M42 stall hook: wait OUTSIDE mythos-tip-gate-write so takeover can enter the group.
+    if: github.event.inputs.phase == 'publish'
+    needs: publish-lock
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Stall outside the write group
+        run: |
+          set -euo pipefail
+          SECS="${{ github.event.inputs.stall_seconds }}"
+          case "$SECS" in
+            ''|*[!0-9]*) echo "stall_seconds must be a non-negative integer"; exit 1 ;;
+          esac
+          echo "stalling ${SECS}s outside mythos-tip-gate-write"
+          sleep "$SECS"
+
+  conclude:
+    if: github.event.inputs.phase == 'publish'
+    needs: [publish-lock, stall]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: write
+      contents: write
+    concurrency:
+      group: mythos-tip-gate-write
+      cancel-in-progress: false
+    steps:
+      - name: Re-read highest epoch, then conclude FAIL or success
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IN_HEAD40: ${{ github.event.inputs.head40 }}
+          IN_EPOCH: ${{ github.event.inputs.epoch }}
+          CHECK_ID: ${{ needs.publish-lock.outputs.check_id }}
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY}"
+          highest_epoch() {
+            gh api "repos/${REPO}/git/matching-refs/mythos-lock" --jq '[.[] | .ref | capture("refs/mythos-lock/(?<n>[0-9]+)$") | .n | tonumber] | if length==0 then 0 else max end'
+          }
+          # Last step before a success or failure conclusion: fresh read of the highest refs/mythos-lock/<n>.
+          # Re-reading only this run's own <n> is not enough (T-M42, T-M44).
+          HIGHEST=$(highest_epoch)
+          echo "bound_epoch=${IN_EPOCH} highest=${HIGHEST} check_id=${CHECK_ID}"
+          if [ -z "$CHECK_ID" ] || [ "$CHECK_ID" = "null" ]; then
+            echo "missing check id; cannot conclude"
+            exit 1
+          fi
+          if [ "$HIGHEST" != "$IN_EPOCH" ]; then
+            TITLE="FAIL: highest epoch ${HIGHEST} != bound ${IN_EPOCH}"
+            CONCLUSION=failure
+            echo "$TITLE"
+          else
+            TITLE="SUCCESS: highest epoch ${HIGHEST}"
+            CONCLUSION=success
+            echo "$TITLE"
+          fi
+          jq -n --arg t "$TITLE" --arg c "$CONCLUSION" \
+            '{name:"mythos/tip-gate",status:"completed",conclusion:$c,output:{title:$t,summary:$t}}' \
+            | gh api --method PATCH "repos/${REPO}/check-runs/${CHECK_ID}" --input -
+          # Not a no-op: a conclusion was written. Exit 0 after FAIL so the run records the test outcome in the check.
+
+  expire-wait:
+    # Wait OUTSIDE the group. Do not cancel this job (plan: gh run cancel is banned).
+    if: github.event.inputs.phase == 'publish'
+    needs: publish-lock
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Wait until expires_at
+        env:
+          IN_EXPIRES: ${{ github.event.inputs.expires_at }}
+        run: |
+          set -euo pipefail
+          NOW=$(date -u +%s)
+          EXP=$(date -u -d "$IN_EXPIRES" +%s)
+          if [ "$EXP" -gt "$NOW" ]; then
+            SLEEP=$((EXP - NOW))
+            echo "expire waiter sleeping ${SLEEP}s outside mythos-tip-gate-write"
+            sleep "$SLEEP"
+          else
+            echo "expires_at already passed"
+          fi
+
+  expire-write:
+    if: github.event.inputs.phase == 'publish'
+    needs: [publish-lock, expire-wait]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: write
+      contents: read
+    concurrency:
+      group: mythos-tip-gate-write
+      cancel-in-progress: false
+    steps:
+      - name: Re-read highest epoch, then FAIL the check as expired
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IN_HEAD40: ${{ github.event.inputs.head40 }}
+          IN_EPOCH: ${{ github.event.inputs.epoch }}
+          CHECK_ID: ${{ needs.publish-lock.outputs.check_id }}
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY}"
+          highest_epoch() {
+            gh api "repos/${REPO}/git/matching-refs/mythos-lock" --jq '[.[] | .ref | capture("refs/mythos-lock/(?<n>[0-9]+)$") | .n | tonumber] | if length==0 then 0 else max end'
+          }
+          HIGHEST=$(highest_epoch)
+          echo "expire-write bound=${IN_EPOCH} highest=${HIGHEST} check_id=${CHECK_ID}"
+          if [ -z "$CHECK_ID" ] || [ "$CHECK_ID" = "null" ]; then
+            echo "no check to expire"
+            exit 0
+          fi
+          jq -n --arg t "expired" '{name:"mythos/tip-gate",status:"completed",conclusion:"failure",output:{title:"expired",summary:"expired"}}' \
+            | gh api --method PATCH "repos/${REPO}/check-runs/${CHECK_ID}" --input -
+          echo "wrote expired failure on check ${CHECK_ID}"
+
+  takeover:
+    if: github.event.inputs.phase == 'takeover'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: write
+      contents: write
+    concurrency:
+      group: mythos-tip-gate-write
+      cancel-in-progress: false
+    steps:
+      - name: Pending old check, create next epoch, FAIL the old check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IN_HEAD40: ${{ github.event.inputs.head40 }}
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY}"
+          if ! printf '%s' "$IN_HEAD40" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "head40 must be a 40-char hex SHA"
+            exit 1
+          fi
+          highest_epoch() {
+            gh api "repos/${REPO}/git/matching-refs/mythos-lock" --jq '[.[] | .ref | capture("refs/mythos-lock/(?<n>[0-9]+)$") | .n | tonumber] | if length==0 then 0 else max end'
+          }
+          # (1) Set the old holder's check to pending on this SHA.
+          HIGHEST=$(highest_epoch)
+          echo "highest before takeover writes: ${HIGHEST}"
+          CHECK_ID=$(gh api "repos/${REPO}/commits/${IN_HEAD40}/check-runs" --jq '[.check_runs[] | select(.name=="mythos/tip-gate" and .status=="in_progress")] | first | .id // empty')
+          if [ -z "$CHECK_ID" ]; then
+            echo "no in_progress mythos/tip-gate check on ${IN_HEAD40}"
+            exit 1
+          fi
+          jq -n '{name:"mythos/tip-gate",status:"in_progress",output:{title:"pending after takeover",summary:"old check set pending before epoch move"}}' \
+            | gh api --method PATCH "repos/${REPO}/check-runs/${CHECK_ID}" --input -
+          echo "set check ${CHECK_ID} pending"
+
+          # (2) Only then move the epoch (create <n+1>).
+          HIGHEST=$(highest_epoch)
+          NEXT=$((HIGHEST + 1))
+          gh api --method POST "repos/${REPO}/git/refs" -f ref="refs/mythos-lock/${NEXT}" -f sha="${IN_HEAD40}"
+          echo "created refs/mythos-lock/${NEXT}"
+
+          # (3) Conclude the old check as failure. The late publish conclude must also FAIL (T-M42).
+          HIGHEST=$(highest_epoch)
+          echo "highest after epoch move: ${HIGHEST}"
+          jq -n --arg t "FAIL: takeover moved epoch to ${HIGHEST}" '{name:"mythos/tip-gate",status:"completed",conclusion:"failure",output:{title:$t,summary:$t}}' \
+            | gh api --method PATCH "repos/${REPO}/check-runs/${CHECK_ID}" --input -
+          echo "failed old check ${CHECK_ID}"
+
+          # (4) Disarm auto-merge if this token is allowed; tip-gate has no pull-requests: write.
+          # mythos-disarm.yml is the path that has that permission. Do not widen this workflow.
+          echo "takeover check revocation complete; auto-merge disarm stays on mythos-disarm.yml or a box tick"
