@@ -1,0 +1,102 @@
+# Narrow default-branch disarm workflow (T-M32 / head-move). No checkout, no PR code.
+# Skips fork PRs and unarmed PRs before joining mythos-tip-gate-write.
+# No secrets stored in this file.
+name: mythos-disarm
+
+on:
+  pull_request_target:
+    types: [synchronize, reopened, converted_to_draft, edited]
+
+permissions:
+  pull-requests: write
+  contents: read
+  checks: write
+
+jobs:
+  preflight:
+    # Outside the write group. Skip forks and unarmed PRs so synchronize cannot flood the group.
+    if: >
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.action != 'edited' || github.event.changes.base != null)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      armed: ${{ steps.check.outputs.armed }}
+      pr_id: ${{ steps.check.outputs.pr_id }}
+      head: ${{ steps.check.outputs.head }}
+    steps:
+      - name: Skip forks (already filtered) and unarmed PRs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_ID: ${{ github.event.pull_request.node_id }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          ARMED=$(gh api graphql -f query='query($id:ID!){ node(id:$id){ ... on PullRequest { autoMergeRequest { enabledAt mergeMethod } } } }' -f id="$PR_ID" --jq '.data.node.autoMergeRequest != null')
+          echo "armed=${ARMED}"
+          echo "armed=${ARMED}" >> "$GITHUB_OUTPUT"
+          echo "pr_id=${PR_ID}" >> "$GITHUB_OUTPUT"
+          echo "head=${HEAD}" >> "$GITHUB_OUTPUT"
+          if [ "$ARMED" != "true" ]; then
+            echo "PR ${PR_NUMBER} is unarmed; not joining mythos-tip-gate-write"
+          fi
+
+  disarm-auto-merge:
+    if: needs.preflight.outputs.armed == 'true'
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Disable auto-merge on head or base change
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_ID: ${{ needs.preflight.outputs.pr_id }}
+        run: |
+          set -euo pipefail
+          gh api graphql -f query='mutation($id:ID!){ disablePullRequestAutoMerge(input:{pullRequestId:$id}) { pullRequest { autoMergeRequest { enabledAt } } } }' -f id="$PR_ID"
+          echo "disarmed auto-merge"
+
+  fail-tip-gate:
+    if: needs.preflight.outputs.armed == 'true'
+    needs: [preflight, disarm-auto-merge]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: write
+      contents: read
+    concurrency:
+      group: mythos-tip-gate-write
+      cancel-in-progress: false
+    steps:
+      - name: Re-read highest epoch, then FAIL mythos/tip-gate on the previous and current heads
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD: ${{ needs.preflight.outputs.head }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY}"
+          highest_epoch() {
+            gh api "repos/${REPO}/git/matching-refs/mythos-lock" --jq '[.[] | .ref | capture("refs/mythos-lock/(?<n>[0-9]+)$") | .n | tonumber] | if length==0 then 0 else max end'
+          }
+          HIGHEST=$(highest_epoch)
+          echo "highest epoch before tip-gate fail writes: ${HIGHEST}"
+          fail_on() {
+            local sha="$1"
+            if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+              return 0
+            fi
+            gh api "repos/${REPO}/commits/${sha}/check-runs" --jq '[.check_runs[] | select(.name=="mythos/tip-gate" and .conclusion!="failure") | .id] | .[]' \
+              | while read -r CID; do
+                  [ -n "$CID" ] || continue
+                  jq -n --arg t "FAIL: head moved" '{name:"mythos/tip-gate",status:"completed",conclusion:"failure",output:{title:$t,summary:$t}}' \
+                    | gh api --method PATCH "repos/${REPO}/check-runs/${CID}" --input -
+                  echo "failed check ${CID} on ${sha}"
+                done
+          }
+          fail_on "$BEFORE"
+          fail_on "$HEAD"
